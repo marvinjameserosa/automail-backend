@@ -1,0 +1,6 @@
+pandas
+PyPDF2
+python-dotenv
+Jinja2
+fastapi
+uvicorn[standard]
