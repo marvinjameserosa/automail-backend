@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers import example
+from .services import email
 from .routers import csv as csv_router
 from .routers import html_template
 
@@ -24,6 +25,7 @@ app.add_middleware(
 app.include_router(csv_router.router)
 app.include_router(example.router)
 app.include_router(html_template.router)
+app.include_router(email.router, prefix="/emails", tags=["emails"])
 
 
 @app.on_event("startup")
