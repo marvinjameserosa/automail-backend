@@ -20,6 +20,7 @@ origins = [
     "https://localhost",
     "https://127.0.0.1:3000",
     "https://127.0.0.1",
+    "https://automail-backend-8qzj.onrender.com"
 ]
 
 # Optionally allow the deployed frontend origin via env var FRONTEND_BASE_URL
