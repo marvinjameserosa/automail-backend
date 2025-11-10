@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from urllib.parse import urlparse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,3 +84,13 @@ async def app_shutdown():
         await csv_router.shutdown_event()
     except Exception:
         pass
+
+
+# Simple health endpoint to validate service availability and CORS behavior.
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "automail-backend",
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
