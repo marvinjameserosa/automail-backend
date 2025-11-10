@@ -1,0 +1,61 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Deploys the FastAPI backend using the existing Dockerfile and an optional Redis instance.
+
+services:
+  - type: web
+    name: automail-backend
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    autoDeploy: true
+    region: oregon
+    # If your app exposes a different path you can change this.
+    healthCheckPath: /dataframes
+    # Environment variables. For secrets (like SENDER_PASSWORD), leave empty and set via the Render dashboard after first deploy.
+    envVars:
+      - key: SENDER_NAME
+        sync: false
+      - key: SENDER_EMAIL
+        sync: false
+      - key: SENDER_PASSWORD
+        sync: false  # Set this secret in Render dashboard (Settings > Environment) after deploy
+      - key: FRONTEND_BASE_URL
+        value: https://your-frontend.onrender.com
+      # Uncomment to override the templates endpoint used by the backend
+      # - key: FRONTEND_TEMPLATES_ENDPOINT
+      #   value: https://your-frontend.onrender.com/api/templates
+      - key: ENABLE_FRONTEND_TEMPLATE_FETCH
+        value: "true"
+      - key: FRONTEND_TEMPLATE_TIMEOUT
+        value: "5.0"
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: automail-redis
+          property: connectionString
+
+  - type: redis
+    name: automail-redis
+    plan: free
+    region: oregon
+    # Keeps Redis private to your services on Render; no public access.
+    ipAllowList: []
+    maxmemoryPolicy: allkeys-lru
+
+# Optional: You can group environment variables instead of defining them on the service.
+# envVarGroups:
+#   - name: automail-backend-config
+#     envVars:
+#       - key: SENDER_NAME
+#         sync: false
+#       - key: SENDER_EMAIL
+#         sync: false
+#       - key: SENDER_PASSWORD
+#         fromSecret: SENDER_PASSWORD
+#       - key: FRONTEND_BASE_URL
+#         value: https://your-frontend.onrender.com
+#       - key: ENABLE_FRONTEND_TEMPLATE_FETCH
+#         value: "true"
+#       - key: FRONTEND_TEMPLATE_TIMEOUT
+#         value: "5.0"
+# Then, attach the group to the web service via: envVarGroups: [automail-backend-config]
