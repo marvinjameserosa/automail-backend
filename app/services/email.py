@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, BaseLoader, select_autoescape
 import httpx
+from email_validator import validate_email, EmailNotValidError
 
 from app.routers.csv import dataframe_store, redis_client, USE_REDIS
 
@@ -69,6 +70,7 @@ class BulkEmailRequest(BaseModel):
     template_id: Optional[str] = None
     template_html: Optional[str] = None
     template_subject: Optional[str] = None
+    async_mode: bool = True  # If false, send synchronously and return summary
 
 TemplatePayload = Dict[str, Any]
 
@@ -336,7 +338,13 @@ def send_single_email(
     html_content = get_html_content(recipient, recipient_data, html_source)
     if not html_content:
         log_email(recipient, recipient_email, cc_list, "None", "Failed", "HTML content failed to render")
-        return {"status": "failed", "error": "HTML content failed to render"}
+        return {
+            "status": "failed",
+            "recipient": recipient,
+            "email": recipient_email,
+            "attachment": "None",
+            "error": "HTML content failed to render",
+        }
     msg.attach(MIMEText(html_content, 'html'))
 
     attachment_info = "None"
@@ -354,10 +362,22 @@ def send_single_email(
             server.sendmail(SENDER_EMAIL, [recipient_email] + cc_list, msg.as_string())
 
         log_email(recipient, recipient_email, cc_list, attachment_info, "Success")
-        return {"status": "success", "message": f"Email sent to {recipient}"}
+        return {
+            "status": "success",
+            "recipient": recipient,
+            "email": recipient_email,
+            "attachment": attachment_info,
+            "message": f"Email sent to {recipient}",
+        }
     except Exception as e:
         log_email(recipient, recipient_email, cc_list, attachment_info, "Failed", str(e))
-        return {"status": "failed", "error": str(e)}
+        return {
+            "status": "failed",
+            "recipient": recipient,
+            "email": recipient_email,
+            "attachment": attachment_info,
+            "error": str(e),
+        }
 
 # API Endpoints
 @router.post("/send")
@@ -423,8 +443,25 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
         request.template_html,
         request.template_subject,
     )
+    # Synchronous mode (helpful for immediate feedback/testing)
+    if not request.async_mode:
+        result = process_bulk_emails(
+            records,
+            request.subject,
+            request.cc_list,
+            request.with_attachments,
+            request.skip_sent,
+            template_payload,
+            request.template_subject,
+        )
+        return {
+            "status": "completed",
+            "upload_id": request.upload_id,
+            "row_count": len(records),
+            **result,
+        }
 
-    # Run in background
+    # Default: run in background
     background_tasks.add_task(
         process_bulk_emails,
         records,
@@ -435,7 +472,7 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
         template_payload,
         request.template_subject,
     )
-    
+
     return {
         "status": "started",
         "message": "Bulk email job started. Check /logs/ for progress.",
@@ -457,11 +494,28 @@ def process_bulk_emails(
         already_sent = get_sent_emails() if skip_sent else set()
         sent_count = 0
         skipped_count = 0
+        invalid_count = 0
+        failed_count = 0
+        details: List[Dict[str, Any]] = []
+        MAX_DETAILS = 100
         cc_list = cc_list or []
         subject_to_use = _determine_subject(subject, template_payload, template_subject_override)
 
         for row in records:
-            recipient_email = str(row.get('email', '') or '').strip()
+            raw_email = str(row.get('email', '') or '').strip()
+            # validate email using email-validator
+            try:
+                v = validate_email(raw_email, check_deliverability=False)
+                recipient_email = v.email
+            except EmailNotValidError:
+                invalid_count += 1
+                if len(details) < MAX_DETAILS:
+                    details.append({
+                        "status": "invalid",
+                        "email": raw_email,
+                        "error": "Invalid email format",
+                    })
+                continue
             recipient = str(row.get('recipient', recipient_email) or '').strip()
 
             if not recipient_email:
@@ -469,6 +523,13 @@ def process_bulk_emails(
 
             if skip_sent and recipient_email in already_sent:
                 skipped_count += 1
+                if len(details) < MAX_DETAILS:
+                    details.append({
+                        "status": "skipped",
+                        "recipient": recipient,
+                        "email": recipient_email,
+                        "reason": "already sent",
+                    })
                 continue
             
             result = send_single_email(
@@ -485,10 +546,20 @@ def process_bulk_emails(
                 sent_count += 1
                 if skip_sent:
                     already_sent.add(recipient_email)
+                if len(details) < MAX_DETAILS:
+                    details.append(result)
+            else:
+                failed_count += 1
+                if len(details) < MAX_DETAILS:
+                    details.append(result)
         
         return {
             "sent": sent_count,
-            "skipped": skipped_count
+            "skipped": skipped_count,
+            "invalid": invalid_count,
+            "failed": failed_count,
+            "details": details,
+            "details_truncated": len(details) >= MAX_DETAILS
         }
     except Exception as e:
         return {"error": str(e)}
