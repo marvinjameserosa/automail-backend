@@ -54,8 +54,9 @@ if _extra_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    # Keep a permissive regex for localhost; remote origins should be explicitly added via env vars above
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    # Allow localhost by default and common app-hosting subdomains to avoid accidental CORS 400 on preflight.
+    # TIP: For stricter control, set FRONTEND_BASE_URL or FRONTEND_ALLOWED_ORIGINS in the environment.
+    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.onrender\.com|https://.*\.vercel\.app)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
