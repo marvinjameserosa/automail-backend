@@ -4,3 +4,4 @@ python-dotenv
 Jinja2
 fastapi
 uvicorn[standard]
+email-validator
