@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Tuple
 import smtplib
 import pandas as pd
@@ -14,7 +14,8 @@ import io
 import json
 from datetime import datetime
 from pathlib import Path
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, BaseLoader, select_autoescape
+import httpx
 
 from app.routers.csv import dataframe_store, redis_client, USE_REDIS
 
@@ -31,22 +32,131 @@ SENDER_NAME = os.getenv("SENDER_NAME", "Your Name")
 LOG_FILE = "email_log.csv"
 HTML_TEMPLATE_FILE = "template.html"
 PDF_FOLDER = "split_pages"
+DEFAULT_EMAIL_SUBJECT = "Change the subject line"
+
+DEFAULT_TEMPLATE_ENDPOINT = "http://localhost:3000/api/templates"
+ENABLE_TEMPLATE_FETCH = os.getenv("ENABLE_FRONTEND_TEMPLATE_FETCH", "true").lower() in {"1", "true", "yes", "on"}
+
+_frontend_endpoint_env = os.getenv("FRONTEND_TEMPLATES_ENDPOINT")
+if _frontend_endpoint_env:
+    FRONTEND_TEMPLATES_ENDPOINT = _frontend_endpoint_env.rstrip("/")
+elif ENABLE_TEMPLATE_FETCH:
+    _frontend_base_env = os.getenv("FRONTEND_BASE_URL")
+    FRONTEND_TEMPLATES_ENDPOINT = f"{_frontend_base_env.rstrip('/')}/api/templates" if _frontend_base_env else DEFAULT_TEMPLATE_ENDPOINT
+else:
+    FRONTEND_TEMPLATES_ENDPOINT = None
+
+FRONTEND_TEMPLATE_TIMEOUT = float(os.getenv("FRONTEND_TEMPLATE_TIMEOUT", "5.0"))
 
 # Request models
 class SingleEmailRequest(BaseModel):
     recipient: str
     recipient_email: str
-    subject: Optional[str] = "Change the subject line"
-    cc_list: Optional[List[str]] = []
-    recipient_data: Optional[Dict] = {}
+    subject: Optional[str] = DEFAULT_EMAIL_SUBJECT
+    cc_list: List[str] = Field(default_factory=list)
+    recipient_data: Dict[str, Any] = Field(default_factory=dict)
     with_attachment: bool = True
+    template_id: Optional[str] = None
+    template_html: Optional[str] = None
+    template_subject: Optional[str] = None
 
 class BulkEmailRequest(BaseModel):
     upload_id: str  # Identifier of the uploaded dataset
-    subject: Optional[str] = "Change the subject line"
-    cc_list: Optional[List[str]] = []
+    subject: Optional[str] = DEFAULT_EMAIL_SUBJECT
+    cc_list: List[str] = Field(default_factory=list)
     with_attachments: bool = True
     skip_sent: bool = True  # Skip already sent emails
+    template_id: Optional[str] = None
+    template_html: Optional[str] = None
+    template_subject: Optional[str] = None
+
+TemplatePayload = Dict[str, Any]
+
+
+def _fetch_template_from_frontend(template_id: str) -> Optional[TemplatePayload]:
+    """Fetch a template payload from the frontend API."""
+    if not FRONTEND_TEMPLATES_ENDPOINT:
+        return None
+
+    template_id = template_id.strip()
+    if not template_id:
+        return None
+
+    url = f"{FRONTEND_TEMPLATES_ENDPOINT.rstrip('/')}/{template_id}"
+    try:
+        response = httpx.get(url, timeout=FRONTEND_TEMPLATE_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        template = data.get("template", data)
+
+        if template and template.get("message"):
+            return {
+                "id": template.get("id") or template_id,
+                "name": template.get("name"),
+                "subject": template.get("subject"),
+                "html": template.get("message"),
+                "filename": template.get("filename"),
+            }
+    except httpx.HTTPStatusError as exc:
+        # 404 should bubble up as not found; other status errors logged for visibility
+        if exc.response.status_code == 404:
+            return None
+        print(f"[email] Frontend template endpoint returned {exc.response.status_code}: {exc.response.text}")
+    except httpx.RequestError as exc:
+        print(f"[email] Failed to reach frontend template endpoint: {exc}")
+    except Exception as exc:
+        print(f"[email] Unexpected error fetching template '{template_id}': {exc}")
+
+    return None
+
+
+def _resolve_template_payload(
+    template_id: Optional[str],
+    template_html: Optional[str],
+    template_subject: Optional[str],
+) -> Optional[TemplatePayload]:
+    """Normalize template references into a consistent payload shape."""
+    template_html = template_html.strip() if template_html and template_html.strip() else None
+    template_subject = template_subject.strip() if template_subject and template_subject.strip() else None
+
+    if template_html:
+        return {
+            "id": template_id.strip() if template_id else "inline-template",
+            "name": None,
+            "subject": template_subject,
+            "html": template_html,
+            "filename": None,
+        }
+
+    if template_id:
+        payload = _fetch_template_from_frontend(template_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"Template not found or unavailable: {template_id}")
+        if template_subject:
+            payload["subject"] = template_subject
+        return payload
+
+    return None
+
+
+def _determine_subject(
+    requested_subject: Optional[str],
+    template_payload: Optional[TemplatePayload],
+    template_subject_override: Optional[str],
+) -> str:
+    """Choose the final email subject following the configured precedence."""
+    candidate = (requested_subject or "").strip() or DEFAULT_EMAIL_SUBJECT
+
+    if template_payload and template_payload.get("subject"):
+        if not requested_subject or requested_subject.strip() == DEFAULT_EMAIL_SUBJECT:
+            candidate = template_payload["subject"]
+            if candidate:
+                return candidate
+
+    if template_subject_override and (not requested_subject or requested_subject.strip() == DEFAULT_EMAIL_SUBJECT):
+        return template_subject_override
+
+    return candidate or DEFAULT_EMAIL_SUBJECT
 
 
 async def _fetch_dataframe(upload_id: str) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -135,27 +245,37 @@ def get_sent_emails():
     except Exception as e:
         return set()
 
-def get_html_content(recipient_name="", recipient_data=None):
-    """Renders the HTML email body from a Jinja2 template."""
-    if not os.path.exists(HTML_TEMPLATE_FILE):
-        return None
+def get_html_content(
+    recipient_name: str = "",
+    recipient_data: Optional[Dict[str, Any]] = None,
+    template_html: Optional[str] = None,
+):
+    """Render the HTML email body from either an inline template or disk file."""
+    template_vars: Dict[str, Any] = {
+        "recipient": recipient_name,
+        "sender_name": SENDER_NAME,
+        "current_date": datetime.now().strftime("%Y-%m-%d"),
+        "current_year": datetime.now().year,
+    }
+    if isinstance(recipient_data, dict):
+        template_vars.update(recipient_data)
+
+    env_kwargs = {"autoescape": select_autoescape(["html", "xml"])}
+
     try:
-        template_dir = os.path.dirname(os.path.abspath(HTML_TEMPLATE_FILE)) or '.'
-        template_name = os.path.basename(HTML_TEMPLATE_FILE)
-        env = Environment(loader=FileSystemLoader(template_dir))
-        template = env.get_template(template_name)
-        
-        template_vars = {
-            'recipient': recipient_name,
-            'sender_name': SENDER_NAME,
-            'current_date': datetime.now().strftime('%Y-%m-%d'),
-            'current_year': datetime.now().year
-        }
-        if recipient_data:
-            template_vars.update(recipient_data)
-        
+        if template_html and template_html.strip():
+            env = Environment(loader=BaseLoader(), **env_kwargs)
+            template = env.from_string(template_html)
+        else:
+            if not os.path.exists(HTML_TEMPLATE_FILE):
+                return None
+            template_dir = os.path.dirname(os.path.abspath(HTML_TEMPLATE_FILE)) or "."
+            template_name = os.path.basename(HTML_TEMPLATE_FILE)
+            env = Environment(loader=FileSystemLoader(template_dir), **env_kwargs)
+            template = env.get_template(template_name)
+
         return template.render(template_vars)
-    except Exception as e:
+    except Exception:
         return None
 
 def find_pdf_for_recipient(recipient_name):
@@ -187,19 +307,33 @@ def attach_pdf(msg, pdf_path):
     except Exception as e:
         return False
 
-def send_single_email(recipient, recipient_email, subject, cc_list, recipient_data, with_attachment):
-    """Builds and sends a single email."""
+def send_single_email(
+    recipient: str,
+    recipient_email: str,
+    subject: Optional[str],
+    cc_list: Optional[List[str]],
+    recipient_data: Optional[Dict[str, Any]],
+    with_attachment: bool,
+    template_payload: Optional[TemplatePayload] = None,
+    template_subject_override: Optional[str] = None,
+):
+    """Build and send a single email using the provided template context."""
     if not all([SENDER_EMAIL, SENDER_PASSWORD]):
         raise HTTPException(status_code=500, detail="Email credentials not configured")
-    
+
+    cc_list = cc_list or []
+    recipient_data = recipient_data or {}
+    subject_to_use = _determine_subject(subject, template_payload, template_subject_override)
+
     msg = MIMEMultipart('mixed' if with_attachment else 'alternative')
-    msg['Subject'] = subject
+    msg['Subject'] = subject_to_use
     msg['From'] = f"{SENDER_NAME} <{SENDER_EMAIL}>"
     msg['To'] = f"{recipient} <{recipient_email}>"
     if cc_list:
         msg['Cc'] = ', '.join(cc_list)
 
-    html_content = get_html_content(recipient, recipient_data)
+    html_source = template_payload["html"] if template_payload and template_payload.get("html") else None
+    html_content = get_html_content(recipient, recipient_data, html_source)
     if not html_content:
         log_email(recipient, recipient_email, cc_list, "None", "Failed", "HTML content failed to render")
         return {"status": "failed", "error": "HTML content failed to render"}
@@ -218,7 +352,7 @@ def send_single_email(recipient, recipient_email, subject, cc_list, recipient_da
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, [recipient_email] + cc_list, msg.as_string())
-        
+
         log_email(recipient, recipient_email, cc_list, attachment_info, "Success")
         return {"status": "success", "message": f"Email sent to {recipient}"}
     except Exception as e:
@@ -239,13 +373,20 @@ def send_email(request: SingleEmailRequest):
     - **with_attachment**: Whether to attach PDF (default: True)
     """
     create_log_file()
+    template_payload = _resolve_template_payload(
+        request.template_id,
+        request.template_html,
+        request.template_subject,
+    )
     result = send_single_email(
         request.recipient,
         request.recipient_email,
         request.subject,
         request.cc_list,
         request.recipient_data,
-        request.with_attachment
+        request.with_attachment,
+        template_payload,
+        request.template_subject,
     )
     return result
 
@@ -277,6 +418,12 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
     if not records:
         raise HTTPException(status_code=400, detail=f"No rows found for upload_id: {request.upload_id}")
     
+    template_payload = _resolve_template_payload(
+        request.template_id,
+        request.template_html,
+        request.template_subject,
+    )
+
     # Run in background
     background_tasks.add_task(
         process_bulk_emails,
@@ -284,7 +431,9 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
         request.subject,
         request.cc_list,
         request.with_attachments,
-        request.skip_sent
+        request.skip_sent,
+        template_payload,
+        request.template_subject,
     )
     
     return {
@@ -300,12 +449,16 @@ def process_bulk_emails(
     cc_list: Optional[List[str]],
     with_attachments: bool,
     skip_sent: bool,
+    template_payload: Optional[TemplatePayload] = None,
+    template_subject_override: Optional[str] = None,
 ):
     """Process bulk emails (runs in background)."""
     try:
         already_sent = get_sent_emails() if skip_sent else set()
         sent_count = 0
         skipped_count = 0
+        cc_list = cc_list or []
+        subject_to_use = _determine_subject(subject, template_payload, template_subject_override)
 
         for row in records:
             recipient_email = str(row.get('email', '') or '').strip()
@@ -321,10 +474,12 @@ def process_bulk_emails(
             result = send_single_email(
                 recipient,
                 recipient_email,
-                subject,
-                cc_list or [],
+                subject_to_use,
+                cc_list,
                 row,
-                with_attachments
+                with_attachments,
+                template_payload,
+                template_subject_override,
             )
             if result.get("status") == "success":
                 sent_count += 1

@@ -60,9 +60,15 @@ Make sure the following files and folders are set up in your project directory:
   SENDER_EMAIL=your_email@gmail.com
   SENDER_PASSWORD=your_app_password
   SENDER_NAME=Your Organization Name
+  FRONTEND_BASE_URL=http://localhost:3000
+  ENABLE_FRONTEND_TEMPLATE_FETCH=true
+  # FRONTEND_TEMPLATES_ENDPOINT=http://localhost:3000/api/templates
+  # FRONTEND_TEMPLATE_TIMEOUT=5.0
   ```
 
   > **Note:** For Gmail, you must generate an "App Password" to use here, not your regular login password.
+
+  When `ENABLE_FRONTEND_TEMPLATE_FETCH` is set to `true`, the backend will retrieve HTML templates from your Next.js frontend instance. `FRONTEND_BASE_URL` is used to derive the templates API endpoint (`/api/templates` by default), but you can override it directly with `FRONTEND_TEMPLATES_ENDPOINT` if the frontend is hosted elsewhere. `FRONTEND_TEMPLATE_TIMEOUT` controls the network timeout (in seconds) for these requests.
 
 - **`input.pdf`**: The master PDF file containing all certificates, one per page.
 
@@ -126,6 +132,35 @@ python auto_email.py
 ```
 
 The script will log its progress in `email_log.csv` and will automatically skip any email addresses that have already been sent successfully.
+
+## API Integration with the Frontend Template Editor
+
+The FastAPI service can now consume templates managed in the Next.js frontend (`automail-frontend/public/templates`). Each template file is exposed through the frontend API with an identifier matching the filename (minus `.html`). When triggering email sends through the backend APIs you can either:
+
+- Reference a stored template by `template_id` (for example, `"icpep-partnership-acceptance-email"`), or
+- Provide raw HTML via `template_html` if you want to send ad-hoc content.
+
+Both `/emails/send` and `/emails/send-bulk` accept the following optional fields in the JSON body:
+
+- `template_id`: string identifier from the frontend template library.
+- `template_html`: inline HTML content to render with Jinja.
+- `template_subject`: subject override that replaces the placeholder subject when one is not provided.
+
+Example payload for `/emails/send`:
+
+```json
+{
+  "recipient": "Jane Doe",
+  "recipient_email": "jane@example.com",
+  "template_id": "icpep-partnership-acceptance-email",
+  "recipient_data": {
+    "company": "ACME Corp"
+  },
+  "with_attachment": false
+}
+```
+
+For bulk jobs, include the same template fields alongside `upload_id`. The backend fetches the HTML once, then renders it for every row in the uploaded dataset.
 
 ### Deactivating the Virtual Environment
 

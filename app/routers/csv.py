@@ -5,7 +5,7 @@ import os
 import io
 import json
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, HTTPException, status, Body, Request
 from fastapi.responses import JSONResponse, Response
 import pandas as pd
 from typing import Iterable
@@ -188,7 +188,7 @@ async def upload_csv(file: UploadFile = File(...), rows_only: bool = False, pret
 
 
 @router.post("/upload-json")
-async def upload_json(file: UploadFile = File(None), payload: dict | list | None = None, rows_only: bool = False, pretty: bool = False, as_text: bool = False):
+async def upload_json(request: Request, file: UploadFile = File(None), payload: dict | list | None = Body(None), rows_only: bool = False, pretty: bool = False, as_text: bool = False):
     """Accept JSON either as a file upload (multipart/form-data) or as an application/json body.
 
     The endpoint expects either:
@@ -214,7 +214,16 @@ async def upload_json(file: UploadFile = File(None), payload: dict | list | None
         data = payload
         filename = "payload.json"
     else:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No JSON file uploaded or JSON body provided")
+        # In some cases, when combining File and Body params, FastAPI may not bind the JSON body to `payload`.
+        # As a fallback, attempt to parse the raw request body as JSON.
+        try:
+            if request.headers.get("content-type", "").startswith("application/json"):
+                data = await request.json()
+                filename = "payload.json"
+            else:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No JSON file uploaded or JSON body provided")
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No JSON file uploaded or JSON body provided")
 
     # Normalize to a list of records
     rows_list = None
