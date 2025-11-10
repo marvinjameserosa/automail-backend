@@ -14,9 +14,11 @@ import io
 import json
 from datetime import datetime
 from pathlib import Path
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, BaseLoader
+import requests
 
 from app.routers.csv import dataframe_store, redis_client, USE_REDIS
+from app.routers.html_template import get_template_content
 
 load_dotenv()
 
@@ -32,6 +34,9 @@ LOG_FILE = "email_log.csv"
 HTML_TEMPLATE_FILE = "template.html"
 PDF_FOLDER = "split_pages"
 
+# Frontend API URL - Configure this to point to your frontend API
+FRONTEND_API_URL = os.getenv("FRONTEND_API_URL", "http://localhost:3000/api")
+
 # Request models
 class SingleEmailRequest(BaseModel):
     recipient: str
@@ -40,6 +45,9 @@ class SingleEmailRequest(BaseModel):
     cc_list: Optional[List[str]] = []
     recipient_data: Optional[Dict] = {}
     with_attachment: bool = True
+    template_name: Optional[str] = None  # Template name to fetch from frontend
+    fetch_from_frontend: bool = False    # Flag to fetch from frontend instead of local storage
+    html_content: Optional[str] = None   # Optional: HTML content provided directly by the frontend
 
 class BulkEmailRequest(BaseModel):
     upload_id: str  # Identifier of the uploaded dataset
@@ -47,6 +55,8 @@ class BulkEmailRequest(BaseModel):
     cc_list: Optional[List[str]] = []
     with_attachments: bool = True
     skip_sent: bool = True  # Skip already sent emails
+    template_name: Optional[str] = None  # Template name
+    fetch_from_frontend: bool = False    # Flag to fetch template from frontend API
 
 
 async def _fetch_dataframe(upload_id: str) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -135,16 +145,86 @@ def get_sent_emails():
     except Exception as e:
         return set()
 
-def get_html_content(recipient_name="", recipient_data=None):
-    """Renders the HTML email body from a Jinja2 template."""
-    if not os.path.exists(HTML_TEMPLATE_FILE):
+def get_html_content(recipient_name="", recipient_data=None, template_name=None, fetch_from_frontend=False, html_override: Optional[str] = None):
+    """
+    Renders the HTML email body from a Jinja2 template.
+
+    Priority:
+      1) If html_override is provided, use it (render with Jinja)
+      2) If fetch_from_frontend=True and template_name provided: fetch from frontend API
+      3) Else try local backend template store
+      4) Else fallback to HTML_TEMPLATE_FILE
+    """
+    html_template = None
+
+    # Highest priority: use HTML directly provided by the requester
+    if html_override:
+        html_template = html_override
+        print(f"🔍 Using html_override provided in request (length={len(html_override)} chars)")
+    else:
+        # Option 1: Fetch template from frontend API
+        if fetch_from_frontend and template_name:
+            try:
+                # Fetch template from frontend API using query parameter
+                frontend_url = f"{FRONTEND_API_URL}/templates?name={template_name}"
+                print(f"🔍 Fetching template from frontend: {frontend_url}")
+
+                response = requests.get(frontend_url, timeout=10)
+                print(f"📡 Frontend response status: {response.status_code}")
+
+                if response.status_code == 200:
+                    # Try to get HTML content from response
+                    # Support both direct HTML response or JSON with html_content field
+                    content_type = response.headers.get('content-type', '')
+                    print(f"📋 Content-Type: {content_type}")
+
+                    if 'application/json' in content_type:
+                        data = response.json()
+                        print(f"🔑 Response keys: {list(data.keys())}")
+                        html_template = data.get('html_content') or data.get('content') or data.get('template')
+
+                        if html_template:
+                            print(f"✅ Successfully fetched template from frontend ({len(html_template)} chars)")
+                        else:
+                            print(f"❌ No html_content in response! Data: {data}")
+                    else:
+                        html_template = response.text
+                        print(f"✅ Successfully fetched template as text ({len(html_template)} chars)")
+                else:
+                    print(f"⚠️ Frontend returned status {response.status_code}, falling back to local")
+                    print(f"   Response: {response.text[:200]}")
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Failed to fetch from frontend: {e}, falling back to local")
+
+        # Option 2: Fetch from local backend template store
+        if not html_template and template_name:
+            try:
+                html_template = get_template_content(template_name)
+            except HTTPException as e:
+                # Template not found in local store
+                pass
+
+        # Option 3: Use default template file
+        if not html_template:
+            if not os.path.exists(HTML_TEMPLATE_FILE):
+                return None
+            try:
+                with open(HTML_TEMPLATE_FILE, 'r', encoding='utf-8') as f:
+                    html_template = f.read()
+            except Exception as e:
+                return None
+
+    if not html_template:
+        print(f"❌ No template found after all attempts")
         return None
+
+    print(f"✅ Template loaded successfully, length: {len(html_template)} chars")
+
     try:
-        template_dir = os.path.dirname(os.path.abspath(HTML_TEMPLATE_FILE)) or '.'
-        template_name = os.path.basename(HTML_TEMPLATE_FILE)
-        env = Environment(loader=FileSystemLoader(template_dir))
-        template = env.get_template(template_name)
-        
+        # Use BaseLoader to render template from string
+        env = Environment(loader=BaseLoader())
+        template = env.from_string(html_template)
+
         template_vars = {
             'recipient': recipient_name,
             'sender_name': SENDER_NAME,
@@ -153,9 +233,12 @@ def get_html_content(recipient_name="", recipient_data=None):
         }
         if recipient_data:
             template_vars.update(recipient_data)
-        
-        return template.render(template_vars)
+
+        rendered = template.render(template_vars)
+        print(f"✅ Template rendered successfully, length: {len(rendered)} chars")
+        return rendered
     except Exception as e:
+        print(f"❌ Template rendering error: {e}")
         return None
 
 def find_pdf_for_recipient(recipient_name):
@@ -187,11 +270,11 @@ def attach_pdf(msg, pdf_path):
     except Exception as e:
         return False
 
-def send_single_email(recipient, recipient_email, subject, cc_list, recipient_data, with_attachment):
+def send_single_email(recipient, recipient_email, subject, cc_list, recipient_data, with_attachment, template_name=None, fetch_from_frontend=False, html_override: Optional[str] = None):
     """Builds and sends a single email."""
     if not all([SENDER_EMAIL, SENDER_PASSWORD]):
         raise HTTPException(status_code=500, detail="Email credentials not configured")
-    
+
     msg = MIMEMultipart('mixed' if with_attachment else 'alternative')
     msg['Subject'] = subject
     msg['From'] = f"{SENDER_NAME} <{SENDER_EMAIL}>"
@@ -199,11 +282,13 @@ def send_single_email(recipient, recipient_email, subject, cc_list, recipient_da
     if cc_list:
         msg['Cc'] = ', '.join(cc_list)
 
-    html_content = get_html_content(recipient, recipient_data)
-    if not html_content:
-        log_email(recipient, recipient_email, cc_list, "None", "Failed", "HTML content failed to render")
-        return {"status": "failed", "error": "HTML content failed to render"}
-    msg.attach(MIMEText(html_content, 'html'))
+    # Get HTML content, preferring html_override when present
+    html_body = get_html_content(recipient, recipient_data, template_name, fetch_from_frontend, html_override=html_override)
+    if not html_body:
+        error_msg = f"HTML template '{template_name}' not found" if template_name else "HTML content failed to render"
+        log_email(recipient, recipient_email, cc_list or [], "None", "Failed", error_msg)
+        return {"status": "failed", "error": error_msg}
+    msg.attach(MIMEText(html_body, 'html'))
 
     attachment_info = "None"
     if with_attachment:
@@ -217,12 +302,12 @@ def send_single_email(recipient, recipient_email, subject, cc_list, recipient_da
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.sendmail(SENDER_EMAIL, [recipient_email] + cc_list, msg.as_string())
-        
-        log_email(recipient, recipient_email, cc_list, attachment_info, "Success")
+            server.sendmail(SENDER_EMAIL, [recipient_email] + (cc_list or []), msg.as_string())
+
+        log_email(recipient, recipient_email, cc_list or [], attachment_info, "Success")
         return {"status": "success", "message": f"Email sent to {recipient}"}
     except Exception as e:
-        log_email(recipient, recipient_email, cc_list, attachment_info, "Failed", str(e))
+        log_email(recipient, recipient_email, cc_list or [], attachment_info, "Failed", str(e))
         return {"status": "failed", "error": str(e)}
 
 # API Endpoints
@@ -230,22 +315,28 @@ def send_single_email(recipient, recipient_email, subject, cc_list, recipient_da
 def send_email(request: SingleEmailRequest):
     """
     Send a single email.
-    
+
     - **recipient**: Name of the recipient
     - **recipient_email**: Email address of the recipient
     - **subject**: Email subject (optional)
     - **cc_list**: List of CC email addresses (optional)
     - **recipient_data**: Additional data for template variables (optional)
     - **with_attachment**: Whether to attach PDF (default: True)
+    - **template_name**: Name of HTML template to use (optional)
+    - **fetch_from_frontend**: If True, fetches template from frontend API (default: False)
+    - **html_content**: If provided, this HTML will be used (highest priority)
     """
     create_log_file()
     result = send_single_email(
         request.recipient,
         request.recipient_email,
         request.subject,
-        request.cc_list,
-        request.recipient_data,
-        request.with_attachment
+        request.cc_list or [],
+        request.recipient_data or {},
+        request.with_attachment,
+        request.template_name,
+        request.fetch_from_frontend,
+        request.html_content
     )
     return result
 
@@ -253,18 +344,20 @@ def send_email(request: SingleEmailRequest):
 async def send_bulk_emails(request: BulkEmailRequest, background_tasks: BackgroundTasks):
     """
     Send bulk emails using a previously uploaded dataset.
-    
+
     - **upload_id**: Identifier returned by the CSV/JSON upload endpoints
     - **subject**: Email subject (optional)
     - **cc_list**: List of CC email addresses (optional)
     - **with_attachments**: Whether to attach PDFs (default: True)
     - **skip_sent**: Skip emails that were already sent successfully (default: True)
-    
+    - **template_name**: Name of HTML template to use (optional)
+    - **fetch_from_frontend**: If True, fetches template from frontend API (default: False)
+
     Returns immediately with a job status. Emails are sent in the background.
     """
     if not all([SENDER_EMAIL, SENDER_PASSWORD]):
         raise HTTPException(status_code=500, detail="Email credentials not configured")
-    
+
     create_log_file()
 
     try:
@@ -276,7 +369,7 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
 
     if not records:
         raise HTTPException(status_code=400, detail=f"No rows found for upload_id: {request.upload_id}")
-    
+
     # Run in background
     background_tasks.add_task(
         process_bulk_emails,
@@ -284,14 +377,20 @@ async def send_bulk_emails(request: BulkEmailRequest, background_tasks: Backgrou
         request.subject,
         request.cc_list,
         request.with_attachments,
-        request.skip_sent
+        request.skip_sent,
+        request.template_name,
+        request.fetch_from_frontend
     )
-    
+
+    template_source = "frontend" if request.fetch_from_frontend else "backend"
+
     return {
         "status": "started",
         "message": "Bulk email job started. Check /logs/ for progress.",
         "upload_id": request.upload_id,
         "row_count": len(records),
+        "template_name": request.template_name or "default",
+        "template_source": template_source
     }
 
 def process_bulk_emails(
@@ -300,6 +399,8 @@ def process_bulk_emails(
     cc_list: Optional[List[str]],
     with_attachments: bool,
     skip_sent: bool,
+    template_name: Optional[str] = None,
+    fetch_from_frontend: bool = False
 ):
     """Process bulk emails (runs in background)."""
     try:
@@ -317,20 +418,24 @@ def process_bulk_emails(
             if skip_sent and recipient_email in already_sent:
                 skipped_count += 1
                 continue
-            
+
+            # For bulk, there is no html_override by default (per-row override could be added if needed)
             result = send_single_email(
                 recipient,
                 recipient_email,
                 subject,
                 cc_list or [],
                 row,
-                with_attachments
+                with_attachments,
+                template_name,
+                fetch_from_frontend,
+                None
             )
             if result.get("status") == "success":
                 sent_count += 1
                 if skip_sent:
                     already_sent.add(recipient_email)
-        
+
         return {
             "sent": sent_count,
             "skipped": skipped_count
