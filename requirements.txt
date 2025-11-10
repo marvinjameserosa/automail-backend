@@ -1,3 +1,4 @@
+redis>=4.5.0
 pandas
 PyPDF2
 python-dotenv
@@ -5,3 +6,12 @@ Jinja2
 fastapi
 uvicorn[standard]
 email-validator
+python-multipart
+redis>=4.5.0
+pandas
+PyPDF2
+python-dotenv
+Jinja2
+fastapi
+uvicorn[standard]
+python-multipart
