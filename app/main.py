@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers import example
+from .services import email
 from .routers import csv as csv_router
 
 # Create the FastAPI app. Disable automatic docs UI (user requested no interactive UI).
@@ -22,6 +23,7 @@ app.add_middleware(
 # include CSV router and the example router
 app.include_router(csv_router.router)
 app.include_router(example.router)
+app.include_router(email.router, prefix="/emails", tags=["emails"])
 
 
 @app.on_event("startup")
