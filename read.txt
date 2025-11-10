@@ -1,0 +1,22 @@
+run the server: 
+
+uvicorn app.main:app --reload --port 8000
+
+upload csv:    
+#running this will generate upload id
+
+curl -s -F "file=@test.csv" "http://localhost:8000/upload-csv" | jq -r '.upload_id'
+
+
+run bulk sending: 
+#change upload id based on generated above
+
+curl -s -X POST "http://localhost:8000/emails/send-bulk" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "upload_id": "6038326c-889b-4053-80e0-8f0102df0fd9",
+    "subject": "Test subject",
+    "cc_list": [],
+    "with_attachments": false,
+    "skip_sent": true
+  }'

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Tuple
 import smtplib
 import pandas as pd
 from email.mime.multipart import MIMEMultipart
@@ -10,9 +10,13 @@ from email import encoders
 from dotenv import load_dotenv
 import os
 import csv
+import io
+import json
 from datetime import datetime
 from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
+
+from app.routers.csv import dataframe_store, redis_client, USE_REDIS
 
 load_dotenv()
 
@@ -38,11 +42,68 @@ class SingleEmailRequest(BaseModel):
     with_attachment: bool = True
 
 class BulkEmailRequest(BaseModel):
-    csv_file: str = "result.csv"  # Path to CSV file
+    upload_id: str  # Identifier of the uploaded dataset
     subject: Optional[str] = "Change the subject line"
     cc_list: Optional[List[str]] = []
     with_attachments: bool = True
     skip_sent: bool = True  # Skip already sent emails
+
+
+async def _fetch_dataframe(upload_id: str) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Retrieve a stored DataFrame by upload_id from Redis or the in-memory store."""
+    df: Optional[pd.DataFrame] = None
+    filename: Optional[str] = None
+
+    if USE_REDIS and redis_client is not None:
+        try:
+            csv_bytes = await redis_client.get(f"upload:{upload_id}:csv")
+            if csv_bytes:
+                csv_text = csv_bytes.decode() if isinstance(csv_bytes, (bytes, bytearray)) else str(csv_bytes)
+                df = pd.read_csv(io.StringIO(csv_text))
+
+                meta_raw = await redis_client.get(f"upload:{upload_id}:meta")
+                if meta_raw:
+                    meta_text = meta_raw.decode() if isinstance(meta_raw, (bytes, bytearray)) else str(meta_raw)
+                    try:
+                        meta = json.loads(meta_text)
+                        filename = meta.get("filename")
+                    except Exception:
+                        filename = None
+        except Exception:
+            df = None
+
+    if df is None:
+        stored = dataframe_store.get(upload_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail=f"upload_id not found: {upload_id}")
+        df = stored["df"]
+        filename = filename or stored.get("filename")
+
+    return df, filename
+
+
+def _dataframe_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Convert a pandas DataFrame to a list of JSON-safe dictionaries."""
+    try:
+        safe_df = df.where(pd.notnull(df), None)
+
+        def _to_py(x: Any) -> Any:
+            try:
+                if hasattr(x, "item"):
+                    return x.item()
+            except Exception:
+                pass
+            return x
+
+        return safe_df.astype(object).where(pd.notnull(safe_df), None).applymap(_to_py).to_dict(orient="records")
+    except Exception:
+        return df.to_dict(orient="records")
+
+
+async def _load_records(upload_id: str) -> List[Dict[str, Any]]:
+    """Load serialized row records for the given upload id."""
+    df, _ = await _fetch_dataframe(upload_id)
+    return _dataframe_to_records(df)
 
 # Helper functions (same as auto_email.py)
 def create_log_file():
@@ -189,11 +250,11 @@ def send_email(request: SingleEmailRequest):
     return result
 
 @router.post("/send-bulk")
-def send_bulk_emails(request: BulkEmailRequest, background_tasks: BackgroundTasks):
+async def send_bulk_emails(request: BulkEmailRequest, background_tasks: BackgroundTasks):
     """
-    Send bulk emails from a CSV file.
+    Send bulk emails using a previously uploaded dataset.
     
-    - **csv_file**: Path to CSV file (default: "result.csv")
+    - **upload_id**: Identifier returned by the CSV/JSON upload endpoints
     - **subject**: Email subject (optional)
     - **cc_list**: List of CC email addresses (optional)
     - **with_attachments**: Whether to attach PDFs (default: True)
@@ -204,15 +265,22 @@ def send_bulk_emails(request: BulkEmailRequest, background_tasks: BackgroundTask
     if not all([SENDER_EMAIL, SENDER_PASSWORD]):
         raise HTTPException(status_code=500, detail="Email credentials not configured")
     
-    if not os.path.exists(request.csv_file):
-        raise HTTPException(status_code=404, detail=f"CSV file not found: {request.csv_file}")
-    
     create_log_file()
+
+    try:
+        records = await _load_records(request.upload_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load dataset: {exc}")
+
+    if not records:
+        raise HTTPException(status_code=400, detail=f"No rows found for upload_id: {request.upload_id}")
     
     # Run in background
     background_tasks.add_task(
         process_bulk_emails,
-        request.csv_file,
+        records,
         request.subject,
         request.cc_list,
         request.with_attachments,
@@ -221,38 +289,47 @@ def send_bulk_emails(request: BulkEmailRequest, background_tasks: BackgroundTask
     
     return {
         "status": "started",
-        "message": "Bulk email job started. Check /logs/ for progress."
+        "message": "Bulk email job started. Check /logs/ for progress.",
+        "upload_id": request.upload_id,
+        "row_count": len(records),
     }
 
-def process_bulk_emails(csv_file, subject, cc_list, with_attachments, skip_sent):
+def process_bulk_emails(
+    records: List[Dict[str, Any]],
+    subject: str,
+    cc_list: Optional[List[str]],
+    with_attachments: bool,
+    skip_sent: bool,
+):
     """Process bulk emails (runs in background)."""
     try:
-        email_df = pd.read_csv(csv_file)
         already_sent = get_sent_emails() if skip_sent else set()
-        
         sent_count = 0
         skipped_count = 0
-        
-        for index, row in email_df.iterrows():
-            recipient_email = str(row.get('email', '')).strip()
-            recipient = str(row.get('recipient', recipient_email)).strip()
+
+        for row in records:
+            recipient_email = str(row.get('email', '') or '').strip()
+            recipient = str(row.get('recipient', recipient_email) or '').strip()
 
             if not recipient_email:
                 continue
 
-            if recipient_email in already_sent:
+            if skip_sent and recipient_email in already_sent:
                 skipped_count += 1
                 continue
             
-            send_single_email(
+            result = send_single_email(
                 recipient,
                 recipient_email,
                 subject,
-                cc_list,
-                row.to_dict(),
+                cc_list or [],
+                row,
                 with_attachments
             )
-            sent_count += 1
+            if result.get("status") == "success":
+                sent_count += 1
+                if skip_sent:
+                    already_sent.add(recipient_email)
         
         return {
             "sent": sent_count,
