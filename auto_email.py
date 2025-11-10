@@ -5,7 +5,7 @@ Automated Email Sender
 Sends personalized bulk emails from a CSV file. Can run with or without PDF attachments.
 
 Requirements:
-    pip install pandas python-dotenv jinja2
+    pip install pandas python-dotenv jinja2 requests
 
 Usage:
     python auto_email.py
@@ -26,7 +26,8 @@ import csv
 from datetime import datetime
 from pathlib import Path
 import logging
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, BaseLoader
+import requests
 
 # --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,10 +47,13 @@ CC_EMAIL_LIST = []
 # Set to True to attach PDFs, False to send without.
 SEND_WITH_ATTACHMENTS = True
 
+# --- Template Configuration ---
+TEMPLATE_NAME = "cisco_interview_email"
+BACKEND_URL = "http://localhost:8000"
+
 # --- File Paths ---
 EMAIL_CSV = "result.csv"
 LOG_FILE = "email_log.csv"
-HTML_TEMPLATE_FILE = "template.html"
 PDF_FOLDER = "split_pages"
 
 def create_log_file():
@@ -82,16 +86,26 @@ def get_sent_emails():
         logging.error(f"Error reading log file: {e}")
         return set()
 
+def get_remote_template():
+    """Fetches the HTML template from the FastAPI backend."""
+    try:
+        url = f"{BACKEND_URL}/templates/{TEMPLATE_NAME}"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch template from backend: {e}")
+        return None
+
 def get_html_content(recipient_name="", recipient_data=None):
-    """Renders the HTML email body from a Jinja2 template."""
-    if not os.path.exists(HTML_TEMPLATE_FILE):
-        logging.error(f"HTML template file '{HTML_TEMPLATE_FILE}' not found.")
+    """Renders the HTML email body from a Jinja2 template fetched from the backend."""
+    html_template = get_remote_template()
+    if not html_template:
+        logging.error("Failed to retrieve HTML template from backend.")
         return None
     try:
-        template_dir = os.path.dirname(os.path.abspath(HTML_TEMPLATE_FILE)) or '.'
-        template_name = os.path.basename(HTML_TEMPLATE_FILE)
-        env = Environment(loader=FileSystemLoader(template_dir))
-        template = env.get_template(template_name)
+        env = Environment(loader=BaseLoader())
+        template = env.from_string(html_template)
         
         template_vars = {
             'recipient': recipient_name,
