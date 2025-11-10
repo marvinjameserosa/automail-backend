@@ -324,6 +324,15 @@ async def upload_json(request: Request, file: UploadFile = File(None), payload: 
     return JSONResponse(content=response)
 
 
+@router.options("/upload-json")
+async def options_upload_json():  # Explicit CORS/preflight handler (some platforms/proxies are picky)
+    return Response(status_code=204)
+
+@router.options("/upload-csv")
+async def options_upload_csv():  # Symmetry for CSV endpoint
+    return Response(status_code=204)
+
+
 
 @router.get("/dataframes/{upload_id}")
 async def get_dataframe(upload_id: str, pretty: bool = False, rows_only: bool = False, as_text: bool = False):
