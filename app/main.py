@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers import example
 from .routers import csv as csv_router
+from .routers import html_template
 
 # Create the FastAPI app. Disable automatic docs UI (user requested no interactive UI).
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -22,6 +23,7 @@ app.add_middleware(
 # include CSV router and the example router
 app.include_router(csv_router.router)
 app.include_router(example.router)
+app.include_router(html_template.router)
 
 
 @app.on_event("startup")
