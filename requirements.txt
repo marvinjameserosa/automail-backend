@@ -1,6 +1,11 @@
+email-validator
+fastapi
+httpx
+Jinja2
 pandas
 PyPDF2
 python-dotenv
-Jinja2
-fastapi
+python-multipart
+redis>=4.5.0
 uvicorn[standard]
+requests
